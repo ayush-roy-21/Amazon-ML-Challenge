@@ -21,7 +21,7 @@ def fetch_and_rank(feat, s1_rows: np.ndarray, tgt_rows: np.ndarray, ctry: Sequen
     ctry_arr = np.asarray(ctry, dtype=object)
     
     t_ctry = ctry_arr[tgt_rows]
-    t_phon = feat.arr["name_phon"][tgt_rows]
+    t_phon = feat.R["name_phon"].to_numpy(dtype=object)[tgt_rows]
     t_post = np.asarray(feat.postal, dtype=object)[tgt_rows]
     
     buckets_1 = defaultdict(list)
@@ -36,7 +36,7 @@ def fetch_and_rank(feat, s1_rows: np.ndarray, tgt_rows: np.ndarray, ctry: Sequen
             if z_prefix: buckets_2[(c, z_prefix)].append(i)
             
     s_ctry = ctry_arr[s1_rows]
-    s_phon = feat.arr["name_phon"][s1_rows]
+    s_phon = feat.R["name_phon"].to_numpy(dtype=object)[s1_rows]
     s_post = np.asarray(feat.postal, dtype=object)[s1_rows]
     
     cands_per_s1 = []
