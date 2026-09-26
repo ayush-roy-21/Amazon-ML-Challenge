@@ -40,10 +40,10 @@ def _max_df(n, cap_frac, abs_cap):
 def _tfidf(texts, analyzer, ngram, max_df):
     if analyzer == "char_wb":
         v = TfidfVectorizer(analyzer="char_wb", ngram_range=ngram, lowercase=False, sublinear_tf=True,
-                            max_df=max_df, dtype=np.float32)
+                            max_df=max_df, min_df=2, dtype=np.float32)
     else:
         v = TfidfVectorizer(analyzer="word", tokenizer=str.split, token_pattern=None, lowercase=False,
-                            ngram_range=ngram, sublinear_tf=True, max_df=max_df, dtype=np.float32)
+                            ngram_range=ngram, sublinear_tf=True, max_df=max_df, min_df=2, dtype=np.float32)
     try:
         return v.fit_transform(texts).tocsr()
     except ValueError:  # empty vocabulary
