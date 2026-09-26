@@ -65,7 +65,7 @@ def main():
 
     # 3. VALIDATE
     cmd_validate = [
-        sys.executable, "-m", "src.validate_submission",
+        sys.executable, "utils/validate_submission.py",
         "--matching", f"{args.out_dir}/matching_results.tsv",
         "--candidate", f"{args.out_dir}/candidate_pairs.tsv",
         "--test-dir", f"{args.data_dir}/test"
