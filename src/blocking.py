@@ -14,6 +14,9 @@ from .utils import log
 BLOCK_VIEWS = ("nchar", "nword", "ncomb", "aword", "nphon")
 Ranked = Dict[str, Tuple[np.ndarray, np.ndarray]]
 
+def _prefixes(p, z):
+    return (str(p)[:4] if p else ""), (str(z)[:3] if z else "")
+
 def fetch_and_rank(feat, s1_rows: np.ndarray, tgt_rows: np.ndarray, ctry: Sequence[str], cfg,
                     depth_scale: float = None) -> Ranked:
     """Deterministic bucket pre-filtering + localized TF-IDF dot products."""
@@ -21,69 +24,93 @@ def fetch_and_rank(feat, s1_rows: np.ndarray, tgt_rows: np.ndarray, ctry: Sequen
     ctry_arr = np.asarray(ctry, dtype=object)
     
     t_ctry = ctry_arr[tgt_rows]
-    t_phon = feat.arr["name_phon"][tgt_rows]
+    
+    # Fallback in case feat.arr doesn't have it (though we just patched it)
+    if "name_phon" in getattr(feat, "arr", {}):
+        t_phon = feat.arr["name_phon"][tgt_rows]
+        s_phon = feat.arr["name_phon"][s1_rows]
+    else:
+        name_phon_arr = feat.R["name_phon"].to_numpy(dtype=object)
+        t_phon = name_phon_arr[tgt_rows]
+        s_phon = name_phon_arr[s1_rows]
+
     t_post = np.asarray(feat.postal, dtype=object)[tgt_rows]
     
-    buckets_1 = defaultdict(list)
-    buckets_2 = defaultdict(list)
+    buckets_c1, buckets_c2 = defaultdict(list), defaultdict(list)
+    buckets_m1, buckets_m2 = defaultdict(list), defaultdict(list)
+    buckets_a1, buckets_a2 = defaultdict(list), defaultdict(list)
     
     log(f"  blocking: building inverted indexes for {len(tgt_rows)} targets...")
     for i, (c, p, z) in enumerate(zip(t_ctry, t_phon, t_post)):
-        p_prefix = str(p)[:4] if p else ""
-        z_prefix = str(z)[:3] if z else ""
-        if c:
-            if p_prefix: buckets_1[(c, p_prefix)].append(i)
-            if z_prefix: buckets_2[(c, z_prefix)].append(i)
+        pp, zp = _prefixes(p, z)
+        if pp:
+            buckets_a1[pp].append(i)
+            (buckets_c1[(c, pp)] if c else buckets_m1[pp]).append(i)
+        if zp:
+            buckets_a2[zp].append(i)
+            (buckets_c2[(c, zp)] if c else buckets_m2[zp]).append(i)
             
     s_ctry = ctry_arr[s1_rows]
-    s_phon = feat.arr["name_phon"][s1_rows]
     s_post = np.asarray(feat.postal, dtype=object)[s1_rows]
     
     cands_per_s1 = []
     log(f"  blocking: fetching candidate pools for {len(s1_rows)} queries...")
     for c, p, z in zip(s_ctry, s_phon, s_post):
+        pp, zp = _prefixes(p, z)
         cands = set()
-        if c:
-            p_prefix = str(p)[:4] if p else ""
-            z_prefix = str(z)[:3] if z else ""
-            if p_prefix: cands.update(buckets_1.get((c, p_prefix), []))
-            if z_prefix: cands.update(buckets_2.get((c, z_prefix), []))
-        cands_per_s1.append(np.array(list(cands), dtype=np.int32))
+        if pp:
+            if c:
+                cands.update(buckets_c1.get((c, pp), []))
+                cands.update(buckets_m1.get(pp, []))
+            else:
+                cands.update(buckets_a1.get(pp, []))
+        if zp:
+            if c:
+                cands.update(buckets_c2.get((c, zp), []))
+                cands.update(buckets_m2.get(zp, []))
+            else:
+                cands.update(buckets_a2.get(zp, []))
+        cands_per_s1.append(np.array(sorted(cands), dtype=np.int32))
         
     out: Ranked = {}
+    max_depth = max(max(1, int(round(cfg.base_k[vv] * scale))) for vv in BLOCK_VIEWS)
+    
     for v in BLOCK_VIEWS:
         depth = max(1, int(round(cfg.base_k[v] * scale)))
-        s1_mat = feat.views[v][s1_rows]
-        tgt_mat = feat.views[v][tgt_rows]
-        
         all_real = np.full((len(s1_rows), depth), -1, dtype=np.int64)
         all_sim = np.zeros((len(s1_rows), depth), dtype=np.float32)
+        out[v] = (all_real, all_sim)
         
-        for i, cands in enumerate(cands_per_s1):
-            if len(cands) == 0:
-                continue
+    s1_mats = {v: feat.views[v][s1_rows] for v in BLOCK_VIEWS}
+    tgt_mats = {v: feat.views[v][tgt_rows] for v in BLOCK_VIEWS}
+
+    for i, cands in enumerate(cands_per_s1):
+        if len(cands) == 0:
+            continue
             
-            # Localized dot product
-            sim = s1_mat[i].dot(tgt_mat[cands].T).toarray().flatten()
+        if len(cands) <= max_depth:
+            for v in BLOCK_VIEWS:
+                k = len(cands)
+                out[v][0][i, :k] = tgt_rows[cands]
+                out[v][1][i, :k] = 1.0
+            continue
             
-            # We bucketed strictly by country, so mismatch penalty doesn't apply here!
-            # However, for robustness if they later relax bucketing:
-            # (We skip penalty for speed, as all fetched candidates strictly match S1 country).
-            
+        for v in BLOCK_VIEWS:
+            sim = s1_mats[v][i].dot(tgt_mats[v][cands].T).toarray().flatten()
+            depth = max(1, int(round(cfg.base_k[v] * scale)))
             k = min(depth, len(sim))
-            # stable argsort is slow on large arrays, but cands is small!
             order = np.argsort(-sim, kind="stable")[:k]
             
-            all_real[i, :k] = tgt_rows[cands[order]]
-            all_sim[i, :k] = sim[order]
+            out[v][0][i, :k] = tgt_rows[cands[order]]
+            out[v][1][i, :k] = sim[order]
             
-        out[v] = (all_real, all_sim)
+    for v in BLOCK_VIEWS:
+        depth = max(1, int(round(cfg.base_k[v] * scale)))
         log(f"  blocking[{v}]: localized dot-product fetched depth={depth} for {len(s1_rows)} rows")
         
     return out
 
 def union_candidates(ranked: Ranked, cfg, k_scale: float) -> List[Set[int]]:
-    """Union, per S1 row, the top candidates across all views."""
     n = next(iter(ranked.values()))[0].shape[0]
     out: List[Set[int]] = [set() for _ in range(n)]
     for v, (idx, _) in ranked.items():
