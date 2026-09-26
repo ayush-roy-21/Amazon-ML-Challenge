@@ -114,6 +114,7 @@ class Featurizer:
         self.addr_head, self.addr_tail = L("addr_head"), L("addr_tail")
         self.postal, self.house, self.ctry = L("postal"), L("house"), L("ctry")
         self.legal, self.acro = L("legal"), L("acro")
+        self.name_phon_str = L("name_phon")
         self.toks = L("name_toks")
         self.tsets = [frozenset(t) for t in self.toks]
         self.psets = [frozenset(p.split()) for p in L("name_phon")]
@@ -127,7 +128,7 @@ class Featurizer:
 
         fields = {"name_core": self.name_core, "name_norm": self.name_norm, "compact": self.compact,
                   "addr_all": self.addr_all, "addr_main": self.addr_main, "addr_lm": self.addr_lm,
-                  "addr_head": self.addr_head, "addr_tail": self.addr_tail, "ctry": self.ctry}
+                  "addr_head": self.addr_head, "addr_tail": self.addr_tail, "ctry": self.ctry, "name_phon": self.name_phon_str}
         self.arr = {k: np.array(v, dtype=object) for k, v in fields.items()}
         self.emp = {k: np.array([len(x) == 0 for x in v], dtype=bool) for k, v in fields.items()}
 
