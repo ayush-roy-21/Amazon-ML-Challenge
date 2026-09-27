@@ -73,8 +73,6 @@ def fetch_and_rank(feat, s1_rows: np.ndarray, tgt_rows: np.ndarray, ctry: Sequen
         cands_per_s1.append(np.array(sorted(cands), dtype=np.int32))
         
     out: Ranked = {}
-    max_depth = max(max(1, int(round(cfg.base_k[vv] * scale))) for vv in BLOCK_VIEWS)
-    
     for v in BLOCK_VIEWS:
         depth = max(1, int(round(cfg.base_k[v] * scale)))
         all_real = np.full((len(s1_rows), depth), -1, dtype=np.int64)
@@ -84,25 +82,34 @@ def fetch_and_rank(feat, s1_rows: np.ndarray, tgt_rows: np.ndarray, ctry: Sequen
     s1_mats = {v: feat.views[v][s1_rows] for v in BLOCK_VIEWS}
     tgt_mats = {v: feat.views[v][tgt_rows] for v in BLOCK_VIEWS}
 
-    for i, cands in enumerate(cands_per_s1):
-        if len(cands) == 0:
-            continue
-            
-        if len(cands) <= max_depth:
+    def _process_chunk(start, end):
+        for i in range(start, end):
+            cands = cands_per_s1[i]
+            if len(cands) == 0:
+                continue
             for v in BLOCK_VIEWS:
-                k = len(cands)
-                out[v][0][i, :k] = tgt_rows[cands]
-                out[v][1][i, :k] = 1.0
-            continue
-            
-        for v in BLOCK_VIEWS:
-            sim = s1_mats[v][i].dot(tgt_mats[v][cands].T).toarray().flatten()
-            depth = max(1, int(round(cfg.base_k[v] * scale)))
-            k = min(depth, len(sim))
-            order = np.argsort(-sim, kind="stable")[:k]
-            
-            out[v][0][i, :k] = tgt_rows[cands[order]]
-            out[v][1][i, :k] = sim[order]
+                depth = max(1, int(round(cfg.base_k[v] * scale)))
+                if len(cands) <= depth:
+                    k = len(cands)
+                    out[v][0][i, :k] = tgt_rows[cands]
+                    out[v][1][i, :k] = 1.0
+                else:
+                    sim = s1_mats[v][i].dot(tgt_mats[v][cands].T).toarray().flatten()
+                    k = depth
+                    order = np.argsort(-sim, kind="stable")[:k]
+                    out[v][0][i, :k] = tgt_rows[cands[order]]
+                    out[v][1][i, :k] = sim[order]
+
+    n_queries = len(s1_rows)
+    n_jobs = getattr(cfg, 'n_jobs', -1)
+    chunk_size = max(1, n_queries // 384)
+    
+    log(f"  blocking: parallelizing localized dot-products across {n_jobs} threads...")
+    from joblib import Parallel, delayed
+    Parallel(n_jobs=n_jobs, backend='threading')(
+        delayed(_process_chunk)(start, min(start + chunk_size, n_queries))
+        for start in range(0, n_queries, chunk_size)
+    )
             
     for v in BLOCK_VIEWS:
         depth = max(1, int(round(cfg.base_k[v] * scale)))
