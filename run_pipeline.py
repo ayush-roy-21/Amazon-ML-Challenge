@@ -12,7 +12,7 @@ import subprocess
 import os
 import os
 # SAFE MODE: Restrict math libraries to prevent 9,000+ thread explosion during blocking
-os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "32"
 os.environ["MKL_NUM_THREADS"] = "1"
 # We deliberately DO NOT restrict OMP_NUM_THREADS here, so LightGBM can use all 96 cores!
 import sys
