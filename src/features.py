@@ -8,6 +8,7 @@ from __future__ import annotations
 import math
 from collections import Counter
 from functools import lru_cache
+import concurrent.futures
 
 import numpy as np
 import pandas as pd
@@ -37,13 +38,13 @@ def _max_df(n, cap_frac, abs_cap):
     return float(max(min(cap_frac, abs_cap / max(n, 1)), min(1.0, 3.0 / max(n, 1))))
 
 
-def _tfidf(texts, analyzer, ngram, max_df):
+def _tfidf(texts, analyzer, ngram, max_df, binary=False, use_idf=True, norm="l2"):
     if analyzer == "char_wb":
-        v = TfidfVectorizer(analyzer="char_wb", ngram_range=ngram, lowercase=False, sublinear_tf=True,
-                            max_df=max_df, min_df=2, dtype=np.float32)
+        v = TfidfVectorizer(analyzer="char_wb", ngram_range=ngram, lowercase=False, sublinear_tf=(not binary),
+                            max_df=max_df, min_df=2, dtype=np.float32, binary=binary, use_idf=use_idf, norm=norm)
     else:
         v = TfidfVectorizer(analyzer="word", tokenizer=str.split, token_pattern=None, lowercase=False,
-                            ngram_range=ngram, sublinear_tf=True, max_df=max_df, min_df=2, dtype=np.float32)
+                            ngram_range=ngram, sublinear_tf=(not binary), max_df=max_df, min_df=2, dtype=np.float32, binary=binary, use_idf=use_idf, norm=norm)
     try:
         return v.fit_transform(texts).tocsr()
     except ValueError:  # empty vocabulary
@@ -126,6 +127,12 @@ class Featurizer:
         self.idf_name, self.idf_name_d = _idf_map(self.toks)
         self.idf_addr, self.idf_addr_d = _idf_map(self.atoks)
 
+        self.t_wa = [np.array([self.idf_name.get(t, self.idf_name_d) for t in ta], dtype=np.float32) if ta else np.zeros(0, dtype=np.float32) for ta in self.toks]
+        self.t_swa = np.array([w.sum() for w in self.t_wa], dtype=np.float32)
+
+        self.a_wa = [np.array([self.idf_addr.get(t, self.idf_addr_d) for t in a], dtype=np.float32) if a else np.zeros(0, dtype=np.float32) for a in self.atoks]
+        self.a_swa = np.array([w.sum() for w in self.a_wa], dtype=np.float32)
+
         fields = {"name_core": self.name_core, "name_norm": self.name_norm, "compact": self.compact,
                   "addr_all": self.addr_all, "addr_main": self.addr_main, "addr_lm": self.addr_lm,
                   "addr_head": self.addr_head, "addr_tail": self.addr_tail, "ctry": self.ctry, "name_phon": self.name_phon_str}
@@ -140,6 +147,7 @@ class Featurizer:
             "nphon": _tfidf(R["name_phon"].tolist(), "word", (1, 1), md_name),
             "achar": _tfidf(R["addr_all"].tolist(), "char_wb", (3, 4), md_addr),
             "aword": _tfidf(R["addr_all"].tolist(), "word", (1, 2), md_addr),
+            "nchar_bin": _tfidf(R["name_core"].tolist(), "char_wb", (3, 4), md_name, binary=True, use_idf=False, norm=None),
         }
         w = math.sqrt(0.5)
         V["ncomb"] = sp.hstack([V["nchar"] * w, V["achar"] * w], format="csr", dtype=np.float32)
@@ -157,6 +165,17 @@ class Featurizer:
         out[(nnz[I] == 0) | (nnz[J] == 0)] = np.nan
         return out
 
+    def _jaccard_sparse(self, view, I, J, chunk=100_000):
+        X, nnz = self.views[view], self._nnz[view]
+        out = np.zeros(len(I), dtype=np.float32)
+        for s in range(0, len(I), chunk):
+            a, b = X[I[s:s + chunk]], X[J[s:s + chunk]]
+            inter = np.asarray(a.multiply(b).sum(axis=1)).ravel()
+            den = nnz[I[s:s + chunk]] + nnz[J[s:s + chunk]] - inter
+            out[s:s + chunk] = np.where(den > 0, inter / den, 0.0)
+        out[(nnz[I] == 0) | (nnz[J] == 0)] = np.nan
+        return out
+
     def _sim(self, field, scorer, I, J, scale=100.0):
         a, e = self.arr[field], self.emp[field]
         out = pair_scores(a[I].tolist(), a[J].tolist(), scorer) / np.float32(scale)
@@ -164,21 +183,9 @@ class Featurizer:
         out[e[I] | e[J]] = np.nan
         return out
 
-    # ------------------------------------------------------------------ per-pair python features
-    def _name_tok(self, i, j):
-        ta, tb = self.toks[i], self.toks[j]
-        if not ta or not tb:
-            return _NAN_NT
-        sa, sb = self.tsets[i], self.tsets[j]
-        ni = len(sa & sb)
-        jacc = ni / (len(sa) + len(sb) - ni)
-        ovmin = ni / min(len(sa), len(sb))
-        idf, d = self.idf_name, self.idf_name_d
-        wa = [idf.get(t, d) for t in ta]
-        wb = [idf.get(t, d) for t in tb]
-        swa, swb = sum(wa), sum(wb)
-        ioa = sum(w for t, w in zip(ta, wa) if t in sb) / swa
-        iob = sum(w for t, w in zip(tb, wb) if t in sa) / swb
+    @staticmethod
+    def _soft_match_single(args):
+        ta, tb, wa, wb, swa, swb = args
         trip = []
         for x, tx in enumerate(ta):
             for y, ty in enumerate(tb):
@@ -194,53 +201,177 @@ class Featurizer:
             ua.add(x)
             ub.add(y)
             ma[x] = mb[y] = -ns
-        soft_a = sum(w * s for w, s in zip(wa, ma)) / swa
-        soft_b = sum(w * s for w, s in zip(wb, mb)) / swb
+        soft_a = sum(w * s for w, s in zip(wa, ma)) / swa if swa > 0 else 0.0
+        soft_b = sum(w * s for w, s in zip(wb, mb)) / swb if swb > 0 else 0.0
         f1 = 2 * soft_a * soft_b / (soft_a + soft_b) if soft_a + soft_b > 0 else 0.0
         unm_a = sum(w * (1.0 - s) for w, s in zip(wa, ma))
         unm_b = sum(w * (1.0 - s) for w, s in zip(wb, mb))
-        ia, ib = self.acro[i], self.acro[j]
-        acro = 1.0 if ((len(ia) >= 2 and ia == self.compact[j]) or (len(ib) >= 2 and ib == self.compact[i])) else 0.0
-        na, nb = self.nums_name[i], self.nums_name[j]
-        num = (1.0 if na == nb else 0.0) if (na and nb) else NAN
-        pa, pb = self.psets[i], self.psets[j]
-        pj = len(pa & pb) / len(pa | pb) if (pa or pb) else NAN
-        return (jacc, ovmin, ioa, iob, soft_a, soft_b, f1, unm_a, unm_b, float(ta[0] == tb[0]),
-                float(ta[-1] == tb[-1]), JaroWinkler.similarity(ta[0], tb[0]), acro, num, pj,
-                float(len(ta)), float(len(tb)))
+        
+        return soft_a, soft_b, f1, unm_a, unm_b
 
-    def _addr_row(self, i, j):
-        pa, pb = self.postal[i], self.postal[j]
-        if pa and pb:
-            pc = 1.0 if pa == pb else -1.0
-            p3, p2 = float(pa[:3] == pb[:3]), float(pa[:2] == pb[:2])
-            try:
-                ld = math.log1p(abs(int(pa) - int(pb)))
-            except ValueError:
-                ld = NAN
-        else:
-            pc, p3, p2, ld = 0.0, NAN, NAN, NAN
-        ha, hb = self.house[i], self.house[j]
-        hn = 0.0 if not (ha and hb) else (1.0 if ha == hb else -1.0)
-        na, nb = self.nums_addr[i], self.nums_addr[j]
-        if na and nb:
-            nc = len(na & nb)
-            nj = nc / len(na | nb)
-            nc = float(nc)
-        else:
-            nj = nc = NAN
-        sa, sb = self.aset[i], self.aset[j]
-        if sa and sb:
-            inter = sa & sb
-            ni = len(inter)
-            jacc = ni / (len(sa) + len(sb) - ni)
-            ovmin = ni / min(len(sa), len(sb))
-            idf, d = self.idf_addr, self.idf_addr_d
-            wa = sum(idf.get(t, d) for t in sa)
-            wb = sum(idf.get(t, d) for t in sb)
-            wi = sum(idf.get(t, d) for t in inter)
-            return (pc, p3, p2, ld, hn, nj, nc, jacc, ovmin, wi / wa, wi / wb, wi)
-        return (pc, p3, p2, ld, hn, nj, nc, NAN, NAN, NAN, NAN, NAN)
+    def _vectorize_nt(self, I, J, workers=-1):
+        if workers < 0:
+            workers = getattr(self.cfg, "n_jobs", -1)
+            if workers < 0:
+                import os
+                workers = os.cpu_count() or 4
+
+        n = len(I)
+        res = {k: np.full(n, NAN, dtype=np.float32) for k in NT_FEATS}
+
+        ta = np.array(self.toks, dtype=object)[I]
+        tb = np.array(self.toks, dtype=object)[J]
+        valid = np.array([bool(x) and bool(y) for x, y in zip(ta, tb)], dtype=bool)
+        idx = np.where(valid)[0]
+
+        if len(idx) == 0:
+            return res
+
+        v_ta, v_tb = ta[idx], tb[idx]
+        v_I, v_J = I[idx], J[idx]
+        
+        sa = np.array(self.tsets, dtype=object)[v_I]
+        sb = np.array(self.tsets, dtype=object)[v_J]
+        
+        len_a = np.array([len(x) for x in sa], dtype=np.float32)
+        len_b = np.array([len(x) for x in sb], dtype=np.float32)
+        ni = np.array([len(a & b) for a, b in zip(sa, sb)], dtype=np.float32)
+        
+        res["nt_jacc"][idx] = ni / (len_a + len_b - ni)
+        res["nt_ovmin"][idx] = ni / np.minimum(len_a, len_b)
+
+        def get_idf_ov_a(k, a_toks, b_set):
+            w = self.t_wa[k]
+            return sum(w[i] for i, t in enumerate(a_toks) if t in b_set)
+        
+        ioa = np.array([get_idf_ov_a(v_I[m], v_ta[m], sb[m]) for m in range(len(idx))], dtype=np.float32)
+        iob = np.array([get_idf_ov_a(v_J[m], v_tb[m], sa[m]) for m in range(len(idx))], dtype=np.float32)
+        
+        res["nt_idfov_a"][idx] = ioa / self.t_swa[v_I]
+        res["nt_idfov_b"][idx] = iob / self.t_swa[v_J]
+        
+        res["nt_first_eq"][idx] = np.array([a[0] == b[0] for a, b in zip(v_ta, v_tb)], dtype=np.float32)
+        res["nt_last_eq"][idx] = np.array([a[-1] == b[-1] for a, b in zip(v_ta, v_tb)], dtype=np.float32)
+        
+        ia = np.array(self.acro, dtype=object)[v_I]
+        ib = np.array(self.acro, dtype=object)[v_J]
+        ca = np.array(self.compact, dtype=object)[v_I]
+        cb = np.array(self.compact, dtype=object)[v_J]
+        
+        acro_arr = [
+            1.0 if ((len(ia[m]) >= 2 and ia[m] == cb[m]) or (len(ib[m]) >= 2 and ib[m] == ca[m])) else 0.0
+            for m in range(len(idx))
+        ]
+        res["nt_acro"][idx] = acro_arr
+        
+        na = np.array(self.nums_name, dtype=object)[v_I]
+        nb = np.array(self.nums_name, dtype=object)[v_J]
+        num_arr = [
+            (1.0 if a == b else 0.0) if (a and b) else NAN
+            for a, b in zip(na, nb)
+        ]
+        res["nt_num"][idx] = num_arr
+        
+        pa = np.array(self.psets, dtype=object)[v_I]
+        pb = np.array(self.psets, dtype=object)[v_J]
+        pj_arr = [
+            len(a & b) / len(a | b) if (a or b) else NAN
+            for a, b in zip(pa, pb)
+        ]
+        res["nt_phon_jacc"][idx] = pj_arr
+        
+        res["nt_ntok_a"][idx] = len_a
+        res["nt_ntok_b"][idx] = len_b
+        
+        # Soft matching
+        first_a = [x[0] for x in v_ta]
+        first_b = [x[0] for x in v_tb]
+        res["nt_first_jw"][idx] = pair_scores(first_a, first_b, JaroWinkler.similarity, workers=workers)
+        
+        args_list = [
+            (v_ta[m], v_tb[m], self.t_wa[v_I[m]], self.t_wa[v_J[m]], self.t_swa[v_I[m]], self.t_swa[v_J[m]])
+            for m in range(len(idx))
+        ]
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+            soft_res = list(pool.map(self._soft_match_single, args_list))
+            
+        if soft_res:
+            res_arr = np.array(soft_res, dtype=np.float32)
+            res["nt_soft_a"][idx] = res_arr[:, 0]
+            res["nt_soft_b"][idx] = res_arr[:, 1]
+            res["nt_soft_f1"][idx] = res_arr[:, 2]
+            res["nt_unm_a"][idx] = res_arr[:, 3]
+            res["nt_unm_b"][idx] = res_arr[:, 4]
+
+        return res
+
+    def _vectorize_addr(self, I, J):
+        n = len(I)
+        res = {k: np.full(n, NAN, dtype=np.float32) for k in AD_FEATS}
+        
+        pa = np.array(self.postal, dtype=object)[I]
+        pb = np.array(self.postal, dtype=object)[J]
+        ha = np.array(self.house, dtype=object)[I]
+        hb = np.array(self.house, dtype=object)[J]
+        na = np.array(self.nums_addr, dtype=object)[I]
+        nb = np.array(self.nums_addr, dtype=object)[J]
+        sa = np.array(self.aset, dtype=object)[I]
+        sb = np.array(self.aset, dtype=object)[J]
+        
+        res["pc_state"][:] = 0.0
+        res["hn_state"][:] = 0.0
+
+        valid_p = (pa != "") & (pb != "")
+        idx_p = np.where(valid_p)[0]
+        if len(idx_p) > 0:
+            v_pa, v_pb = pa[idx_p], pb[idx_p]
+            res["pc_state"][idx_p] = np.where(v_pa == v_pb, 1.0, -1.0)
+            res["pc_p3"][idx_p] = [a[:3] == b[:3] for a, b in zip(v_pa, v_pb)]
+            res["pc_p2"][idx_p] = [a[:2] == b[:2] for a, b in zip(v_pa, v_pb)]
+            
+            ld_arr = []
+            for a, b in zip(v_pa, v_pb):
+                try:
+                    ld_arr.append(math.log1p(abs(int(a) - int(b))))
+                except ValueError:
+                    ld_arr.append(NAN)
+            res["pc_logdiff"][idx_p] = ld_arr
+        
+        valid_h = (ha != "") & (hb != "")
+        res["hn_state"][valid_h] = np.where(ha[valid_h] == hb[valid_h], 1.0, -1.0)
+        
+        valid_n = np.array([bool(a) and bool(b) for a, b in zip(na, nb)], dtype=bool)
+        idx_n = np.where(valid_n)[0]
+        if len(idx_n) > 0:
+            v_na, v_nb = na[idx_n], nb[idx_n]
+            ni_n = np.array([len(a & b) for a, b in zip(v_na, v_nb)], dtype=np.float32)
+            nu_n = np.array([len(a | b) for a, b in zip(v_na, v_nb)], dtype=np.float32)
+            res["nums_common"][idx_n] = ni_n
+            res["nums_jacc"][idx_n] = ni_n / nu_n
+            
+        valid_a = np.array([bool(a) and bool(b) for a, b in zip(sa, sb)], dtype=bool)
+        idx_a = np.where(valid_a)[0]
+        if len(idx_a) > 0:
+            v_sa, v_sb = sa[idx_a], sb[idx_a]
+            v_I, v_J = I[idx_a], J[idx_a]
+            inter = [a & b for a, b in zip(v_sa, v_sb)]
+            ni_a = np.array([len(x) for x in inter], dtype=np.float32)
+            len_a = np.array([len(x) for x in v_sa], dtype=np.float32)
+            len_b = np.array([len(x) for x in v_sb], dtype=np.float32)
+            
+            res["at_jacc"][idx_a] = ni_a / (len_a + len_b - ni_a)
+            res["at_ovmin"][idx_a] = ni_a / np.minimum(len_a, len_b)
+            
+            def get_wi(k, inter_set):
+                return sum(self.idf_addr.get(t, self.idf_addr_d) for t in inter_set)
+                
+            wi_arr = np.array([get_wi(m, inter[m]) for m in range(len(idx_a))], dtype=np.float32)
+            res["at_idfov_common"][idx_a] = wi_arr
+            res["at_idfov_a"][idx_a] = wi_arr / self.a_swa[v_I]
+            res["at_idfov_b"][idx_a] = wi_arr / self.a_swa[v_J]
+            
+        return res
 
     # ------------------------------------------------------------------ main entry
     def pair_features(self, I, J, chunk=200_000) -> pd.DataFrame:
@@ -248,10 +379,12 @@ class Featurizer:
         return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
 
     def _chunk(self, I, J) -> pd.DataFrame:
-        n = len(I)
         F = {}
-        for v in self.views:
+        for v in ["nchar", "nword", "nphon", "achar", "aword", "ncomb"]:
             F["cos_" + v] = self._cos(v, I, J)
+            
+        F["name_char_overlap_34"] = self._jaccard_sparse("nchar_bin", I, J)
+
         # ---- names (core = legal forms removed)
         F["n_ratio"] = self._sim("name_core", fuzz.ratio, I, J)
         F["n_pratio"] = self._sim("name_core", fuzz.partial_ratio, I, J)
@@ -260,6 +393,7 @@ class Featurizer:
         F["n_wratio"] = self._sim("name_core", fuzz.WRatio, I, J)
         F["n_jw"] = self._sim("name_core", JaroWinkler.similarity, I, J, 1.0)
         F["n_lev"] = self._sim("name_core", Levenshtein.normalized_similarity, I, J, 1.0)
+        F["n_phon_ratio"] = self._sim("name_phon", fuzz.ratio, I, J)
         F["n_full_tset"] = self._sim("name_norm", fuzz.token_set_ratio, I, J)
         F["n_full_ratio"] = self._sim("name_norm", fuzz.ratio, I, J)
         F["n_c_ratio"] = self._sim("compact", fuzz.ratio, I, J)
@@ -269,10 +403,13 @@ class Featurizer:
         la = np.array([len(x) for x in self.arr["name_core"][I]], dtype=np.float32)
         lb = np.array([len(x) for x in self.arr["name_core"][J]], dtype=np.float32)
         F["n_len_a"], F["n_len_b"], F["n_len_diff"] = la, lb, np.abs(la - lb)
+        
         lga, lgb = np.array(self.legal, dtype=object)[I], np.array(self.legal, dtype=object)[J]
         F["legal_both"] = ((lga != "") & (lgb != "")).astype(np.float32)
         F["legal_eq"] = ((lga == lgb) & (lga != "")).astype(np.float32)
         F["legal_one"] = ((lga != "") ^ (lgb != "")).astype(np.float32)
+        F["legal_mismatch_penalty"] = np.where((lga != "") & (lgb != "") & (lga != lgb), -1.0, 0.0).astype(np.float32)
+
         # ---- addresses
         F["a_tset"] = self._sim("addr_all", fuzz.token_set_ratio, I, J)
         F["a_tsort"] = self._sim("addr_all", fuzz.token_sort_ratio, I, J)
@@ -286,23 +423,28 @@ class Featurizer:
         F["a_missing_b"] = self.emp["addr_all"][J].astype(np.float32)
         F["a_lm_a"] = (~self.emp["addr_lm"][I]).astype(np.float32)
         F["a_lm_b"] = (~self.emp["addr_lm"][J]).astype(np.float32)
+        
+        pa, pb = np.array(self.postal, dtype=object)[I], np.array(self.postal, dtype=object)[J]
+        F["addr_postal_match"] = np.where((pa != "") & (pb != "") & (pa == pb), 1.0, 0.0).astype(np.float32)
+
         # ---- country (open-set: only (dis)agreement of the labels is used)
         ca, cb = self.arr["ctry"][I], self.arr["ctry"][J]
         miss = self.emp["ctry"][I] | self.emp["ctry"][J]
         F["ctry_state"] = np.where(miss, 0.0, np.where(ca == cb, 1.0, -1.0)).astype(np.float32)
         F["ctry_fuzzy"] = self._sim("ctry", fuzz.ratio, I, J)
         F["is_s3"] = (self.src[J] == 3).astype(np.float32)
+
         # ---- python-level token / address features
-        nt = np.empty((n, len(NT_FEATS)), dtype=np.float32)
-        ad = np.empty((n, len(AD_FEATS)), dtype=np.float32)
-        for k in range(n):
-            i, j = int(I[k]), int(J[k])
-            nt[k] = self._name_tok(i, j)
-            ad[k] = self._addr_row(i, j)
-        for c, name in enumerate(NT_FEATS):
-            F[name] = nt[:, c]
-        for c, name in enumerate(AD_FEATS):
-            F[name] = ad[:, c]
+        nt_dict = self._vectorize_nt(I, J)
+        ad_dict = self._vectorize_addr(I, J)
+        
+        for k, v in nt_dict.items():
+            F[k] = v
+        for k, v in ad_dict.items():
+            F[k] = v
+            
+        F["n_exact_first_tok"] = F["nt_first_eq"]
+
         return pd.DataFrame({k: np.asarray(v, dtype=np.float32) for k, v in F.items()})
 
 

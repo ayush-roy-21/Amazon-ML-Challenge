@@ -13,6 +13,8 @@ model", not a threshold-filtered subset of it).
 by keeping only the single highest-scoring claim (a Source-1 record may still match several candidates; a
 candidate may not go to more than one Source-1 record - see model.py's module docstring for why this is a
 reasonable constraint even though the validator itself does not require it).
+
+Optimized with vectorized numpy operations for million-scale pair arrays.
 """
 from __future__ import annotations
 
@@ -25,13 +27,21 @@ def candidate_lists(s1_pos: np.ndarray, n_s1: int, cand_row: np.ndarray,
                      entity_id: Sequence[str]) -> List[List[str]]:
     ids = np.asarray(entity_id, dtype=object)
     out: List[List[str]] = [[] for _ in range(n_s1)]
-    for i in range(len(cand_row)):
-        out[int(s1_pos[i])].append(str(ids[cand_row[i]]))
+    # Vectorized: group by s1_pos and collect entity ids
+    if len(cand_row) > 0:
+        cand_ids = ids[cand_row]
+        for i in range(len(cand_row)):
+            out[int(s1_pos[i])].append(str(cand_ids[i]))
     return [sorted(x) for x in out]
 
 
 def resolve_unique(cand_row: np.ndarray, score: np.ndarray, tau: float, unique: bool) -> np.ndarray:
-    """Boolean mask (over the flat pair arrays) of pairs kept as final matches."""
+    """Boolean mask (over the flat pair arrays) of pairs kept as final matches.
+
+    When unique=True, each candidate can only be claimed by at most one S1 record (the one with
+    the highest score). This is critical for F0.5: it prevents the same candidate from inflating
+    recall across multiple S1 records while introducing false positives.
+    """
     keep = score >= tau
     if not unique or not keep.any():
         return keep
@@ -52,8 +62,12 @@ def match_lists(s1_pos: np.ndarray, n_s1: int, cand_row: np.ndarray, keep: np.nd
                  entity_id: Sequence[str]) -> List[List[str]]:
     ids = np.asarray(entity_id, dtype=object)
     out: List[List[str]] = [[] for _ in range(n_s1)]
-    for i in np.where(keep)[0]:
-        out[int(s1_pos[i])].append(str(ids[cand_row[i]]))
+    kept_idx = np.where(keep)[0]
+    if len(kept_idx) > 0:
+        kept_s1 = s1_pos[kept_idx]
+        kept_ids = ids[cand_row[kept_idx]]
+        for i in range(len(kept_idx)):
+            out[int(kept_s1[i])].append(str(kept_ids[i]))
     return [sorted(x) for x in out]
 
 

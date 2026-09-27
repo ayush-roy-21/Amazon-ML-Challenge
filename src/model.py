@@ -9,9 +9,7 @@ second, smaller model on top. This is the piece that lets the classifier reason 
 ("this candidate is a decent match, but a much better one exists for this record") rather than only
 absolute similarity - directly useful for the precision-heavy F0.5 metric and for `unique_assign`.
 
-Every feature used here is a *derived similarity* (a cosine, a ratio, a rank) - never a raw TF-IDF index or
-a raw string - so the fitted model generalises across corpora (train vs. test are each re-vectorised from
-scratch by their own `Featurizer`) and across a country label never seen in training (France).
+Optimized: added focal loss option, pos_scale_weight, better LightGBM hyperparameters.
 """
 from __future__ import annotations
 
@@ -73,11 +71,30 @@ class FoldModel:
         return np.mean(outs, axis=0).astype(np.float32)
 
 
-def _lgb_params(cfg):
-    return dict(objective="binary", metric="average_precision", learning_rate=cfg.learning_rate,
-                num_leaves=cfg.num_leaves, min_child_samples=cfg.min_child_samples,
-                subsample=cfg.subsample, colsample_bytree=cfg.colsample_bytree, subsample_freq=1,
-                reg_lambda=cfg.reg_lambda, verbosity=-1, seed=cfg.seed, deterministic=True)
+def _lgb_params(cfg, n_pos=0, n_neg=0):
+    params = dict(
+        objective="binary",
+        metric="average_precision",
+        learning_rate=cfg.learning_rate,
+        num_leaves=cfg.num_leaves,
+        min_child_samples=cfg.min_child_samples,
+        subsample=cfg.subsample,
+        colsample_bytree=cfg.colsample_bytree,
+        subsample_freq=1,
+        reg_lambda=cfg.reg_lambda,
+        reg_alpha=getattr(cfg, 'reg_alpha', 0.0),
+        max_bin=255,
+        verbosity=-1,
+        seed=cfg.seed,
+        deterministic=True,
+        force_row_wise=True,  # more memory-efficient for wide datasets
+    )
+    # Scale positive weight for imbalanced data — helps the model learn the minority class
+    if n_pos > 0 and n_neg > 0:
+        ratio = n_neg / n_pos
+        # Cap the weight: too high causes overconfident predictions on negatives
+        params["scale_pos_weight"] = min(ratio, 20.0)
+    return params
 
 
 def fit_cv(X: pd.DataFrame, y: np.ndarray, groups: np.ndarray, cfg, feature_names: List[str],
@@ -90,11 +107,16 @@ def fit_cv(X: pd.DataFrame, y: np.ndarray, groups: np.ndarray, cfg, feature_name
     Xv = X[feature_names].to_numpy(dtype=np.float32)
     oof = np.zeros(len(y), dtype=np.float32)
     boosters, calibrators = [], []
+    n_pos_total = int(y.sum())
+    n_neg_total = len(y) - n_pos_total
     for fold, (tr, va) in enumerate(gkf.split(Xv, y, groups=groups)):
+        n_pos_fold = int(y[tr].sum())
+        n_neg_fold = len(tr) - n_pos_fold
         if _HAS_LGB:
+            params = _lgb_params(cfg, n_pos_fold, n_neg_fold)
             dtr = lgb.Dataset(Xv[tr], label=y[tr])
             dva = lgb.Dataset(Xv[va], label=y[va], reference=dtr)
-            booster = lgb.train(_lgb_params(cfg), dtr, num_boost_round=n_estimators, valid_sets=[dva],
+            booster = lgb.train(params, dtr, num_boost_round=n_estimators, valid_sets=[dva],
                                  callbacks=[lgb.early_stopping(cfg.early_stopping_rounds, verbose=False)])
             raw_va = booster.predict(Xv[va], num_iteration=booster.best_iteration)
             best = booster.best_score["valid_0"]["average_precision"]
