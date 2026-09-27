@@ -17,7 +17,7 @@ class Config:
     country_penalty: float = 0.55     # cosine multiplier when both country labels are known and differ
     target_recall: float = 0.995      # k_scale is increased on the training data until this recall is reached
     k_scales: tuple = (1.0, 1.5, 2.0, 2.5, 3.0)
-    max_df_abs: int = 2000            # n-grams / tokens present in more docs than this are dropped from TF-IDF
+    max_df_abs: int = 800            # n-grams / tokens present in more docs than this are dropped from TF-IDF
 
     # ---------------- model ----------------
     n_folds: int = 5
