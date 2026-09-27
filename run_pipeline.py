@@ -34,6 +34,7 @@ def main():
     parser = argparse.ArgumentParser(description="Run the full LightGBM entity resolution pipeline.")
     parser.add_argument("--predict-only", action="store_true", help="Skip training, only predict")
     parser.add_argument("--fast", action="store_true", help="Use fewer folds/trees for faster execution")
+    parser.add_argument("--no-country-holdout", action="store_true", help="Disable the country holdout diagnostic model")
     parser.add_argument("--data-dir", default="dataset", help="Directory containing train/ and test/")
     parser.add_argument("--model-dir", default="models", help="Directory to save/load the model")
     parser.add_argument("--out-dir", default="output", help="Directory to save the final TSVs")
@@ -50,6 +51,8 @@ def main():
         cmd_train = [sys.executable, "-m", "src.train", "--data-dir", args.data_dir, "--model-dir", args.model_dir]
         if args.fast:
             cmd_train.append("--fast")
+        if args.no_country_holdout:
+            cmd_train.append("--no-country-holdout")
         run_command(cmd_train, "Training LightGBM Model")
     else:
         print(f"\n⏭️ Skipping training (--predict-only). Using existing models in {args.model_dir}/")
