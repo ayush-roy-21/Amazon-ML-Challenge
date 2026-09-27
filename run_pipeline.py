@@ -9,6 +9,11 @@ Usage:
 """
 import argparse
 import subprocess
+import os
+# Prevent thread oversubscription when using multiprocessing
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
 import sys
 import time
 from pathlib import Path
