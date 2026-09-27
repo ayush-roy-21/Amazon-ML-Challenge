@@ -121,7 +121,8 @@ def fetch_and_rank(feat, s1_rows: np.ndarray, tgt_rows: np.ndarray, ctry: Sequen
 
         # ThreadPoolExecutor is ideal here: scipy sparse dot releases the GIL
         chunks = list(range(0, n_s1, chunk_size))
-        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+        # EMERGENCY FIX: Restrict to 3 workers to prevent 8-Terabyte RAM explosion
+        with ThreadPoolExecutor(max_workers=3) as pool:
             results = list(pool.map(process_chunk, chunks))
 
         for start, end, abs_idx, scores in results:
