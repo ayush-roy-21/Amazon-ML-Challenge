@@ -141,23 +141,14 @@ class Featurizer:
 
         md_name = _max_df(n, 0.2, cfg.max_df_abs)
         md_addr = _max_df(n, 0.1, cfg.max_df_abs)
-        from joblib import Parallel, delayed
-        tasks = [
-            ("nchar", R["name_core"].tolist(), "char_wb", (3, 4), md_name, False, True, "l2"),
-            ("nword", R["name_toks_str"].tolist(), "word", (1, 2), md_name, False, True, "l2"),
-            ("nphon", R["name_phon"].tolist(), "word", (1, 1), md_name, False, True, "l2"),
-            ("achar", R["addr_all"].tolist(), "char_wb", (3, 4), md_addr, False, True, "l2"),
-            ("aword", R["addr_all"].tolist(), "word", (1, 2), md_addr, False, True, "l2"),
-            ("nchar_bin", R["name_core"].tolist(), "char_wb", (3, 4), md_name, True, False, None),
-        ]
-        
-        # Run all 6 TF-IDF matrix builds simultaneously across 6 CPU cores!
-        results = Parallel(n_jobs=6)(
-            delayed(_tfidf)(texts, analyzer, ngram, max_df, binary, use_idf, norm)
-            for name, texts, analyzer, ngram, max_df, binary, use_idf, norm in tasks
-        )
-        
-        V = {tasks[i][0]: results[i] for i in range(len(tasks))}
+        V = {
+            "nchar": _tfidf(R["name_core"].tolist(), "char_wb", (3, 4), md_name),
+            "nword": _tfidf(R["name_toks_str"].tolist(), "word", (1, 2), md_name),
+            "nphon": _tfidf(R["name_phon"].tolist(), "word", (1, 1), md_name),
+            "achar": _tfidf(R["addr_all"].tolist(), "char_wb", (3, 4), md_addr),
+            "aword": _tfidf(R["addr_all"].tolist(), "word", (1, 2), md_addr),
+            "nchar_bin": _tfidf(R["name_core"].tolist(), "char_wb", (3, 4), md_name, binary=True, use_idf=False, norm=None),
+        }
         w = math.sqrt(0.5)
         V["ncomb"] = sp.hstack([V["nchar"] * w, V["achar"] * w], format="csr", dtype=np.float32)
         self.views = V
