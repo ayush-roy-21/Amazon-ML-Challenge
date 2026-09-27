@@ -59,7 +59,7 @@ def fetch_and_rank(feat, s1_rows: np.ndarray, tgt_rows: np.ndarray, ctry: Sequen
     scale = cfg.kmax_factor if depth_scale is None else depth_scale
     n_s1 = len(s1_rows)
     n_tgt = len(tgt_rows)
-    chunk_size = 2000  # SAFE MODE: reduced from 5000 to prevent OOM on 12.5M  # Tuned for memory: ~5k rows × n_tgt scores fits comfortably in RAM
+    chunk_size = 500  # SAFE MODE: reduced from 5000 to prevent OOM on 12.5M  # Tuned for memory: ~5k rows × n_tgt scores fits comfortably in RAM
 
     # Pre-process country arrays for vectorized penalty application
     ctry_arr = np.asarray(ctry, dtype=object)
