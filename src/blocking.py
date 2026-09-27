@@ -7,14 +7,18 @@ from __future__ import annotations
 
 from typing import Dict, List, Sequence, Set, Tuple
 from collections import defaultdict
+import multiprocessing as mp
 import numpy as np
+import math
 
 from .utils import log
 
 BLOCK_VIEWS = ("nchar", "nword", "ncomb", "aword", "nphon")
 Ranked = Dict[str, Tuple[np.ndarray, np.ndarray]]
 
-import math
+_GLOBAL_BUCKETS = {}
+_GLOBAL_DOT_VARS = {}
+
 def _safe_str(x):
     if x is None: return ""
     if isinstance(x, float) and math.isnan(x): return ""
@@ -24,8 +28,6 @@ def _safe_str(x):
 
 def _prefixes(p, z):
     return _safe_str(p)[:4], _safe_str(z)[:3]
-
-_GLOBAL_BUCKETS = {}
 
 def _cands_for_row(args):
     c, p, z = args
@@ -47,15 +49,47 @@ def _cands_for_row(args):
             cands.update(b['a2'].get(zp, []))
     return np.array(sorted(cands), dtype=np.int32)
 
+def _process_dot_chunk(args):
+    start, end = args
+    chunk_size = end - start
+    chunk_out = {}
+    cfg_base_k = _GLOBAL_DOT_VARS['base_k']
+    scale = _GLOBAL_DOT_VARS['scale']
+    cands_arr = _GLOBAL_DOT_VARS['cands_per_s1']
+    s1_mats = _GLOBAL_DOT_VARS['s1_mats']
+    tgt_mats = _GLOBAL_DOT_VARS['tgt_mats']
+    tgt_rows = _GLOBAL_DOT_VARS['tgt_rows']
+    
+    for v in BLOCK_VIEWS:
+        depth = max(1, int(round(cfg_base_k[v] * scale)))
+        chunk_out[v] = (np.full((chunk_size, depth), -1, dtype=np.int64),
+                        np.zeros((chunk_size, depth), dtype=np.float32))
+                        
+    for i_local, i_global in enumerate(range(start, end)):
+        cands = cands_arr[i_global]
+        if len(cands) == 0:
+            continue
+        for v in BLOCK_VIEWS:
+            depth = max(1, int(round(cfg_base_k[v] * scale)))
+            if len(cands) <= depth:
+                k = len(cands)
+                chunk_out[v][0][i_local, :k] = tgt_rows[cands]
+                chunk_out[v][1][i_local, :k] = 1.0
+            else:
+                sim = s1_mats[v][i_global].dot(tgt_mats[v][cands].T).toarray().flatten()
+                k = min(depth, len(sim))
+                order = np.argsort(-sim, kind="stable")[:k]
+                chunk_out[v][0][i_local, :k] = tgt_rows[cands[order]]
+                chunk_out[v][1][i_local, :k] = sim[order]
+    return chunk_out
+
 def fetch_and_rank(feat, s1_rows: np.ndarray, tgt_rows: np.ndarray, ctry: Sequence[str], cfg,
                     depth_scale: float = None) -> Ranked:
-    """Deterministic bucket pre-filtering + localized TF-IDF dot products."""
     scale = cfg.kmax_factor if depth_scale is None else depth_scale
     ctry_arr = np.asarray(ctry, dtype=object)
     
     t_ctry = ctry_arr[tgt_rows]
     
-    # Fallback in case feat.arr doesn't have it (though we just patched it)
     if "name_phon" in getattr(feat, "arr", {}):
         t_phon = feat.arr["name_phon"][tgt_rows]
         s_phon = feat.arr["name_phon"][s1_rows]
@@ -84,7 +118,6 @@ def fetch_and_rank(feat, s1_rows: np.ndarray, tgt_rows: np.ndarray, ctry: Sequen
     s_ctry = ctry_arr[s1_rows]
     s_post = np.asarray(feat.postal, dtype=object)[s1_rows]
     
-    log(f"  blocking: fetching candidate pools for {len(s1_rows)} queries using multiprocessing...")
     global _GLOBAL_BUCKETS
     _GLOBAL_BUCKETS = {
         'c1': buckets_c1, 'c2': buckets_c2,
@@ -92,11 +125,11 @@ def fetch_and_rank(feat, s1_rows: np.ndarray, tgt_rows: np.ndarray, ctry: Sequen
         'a1': buckets_a1, 'a2': buckets_a2
     }
 
-    import multiprocessing as mp
     n_jobs = getattr(cfg, 'n_jobs', -1)
     if n_jobs <= 0:
         n_jobs = mp.cpu_count()
         
+    log(f"  blocking: fetching candidate pools for {len(s1_rows)} queries using multiprocessing...")
     with mp.get_context("fork").Pool(processes=n_jobs) as pool:
         cands_per_s1 = pool.map(_cands_for_row, zip(s_ctry, s_phon, s_post), chunksize=2000)
         
@@ -120,14 +153,10 @@ def fetch_and_rank(feat, s1_rows: np.ndarray, tgt_rows: np.ndarray, ctry: Sequen
         'tgt_rows': tgt_rows
     }
     
-    n_queries = len(s1_rows)
-    n_jobs = getattr(cfg, 'n_jobs', -1)
-    if n_jobs <= 0:
-        n_jobs = mp.cpu_count()
-    chunk_size = max(1, n_queries // (n_jobs * 4))
+    chunk_size = max(1, len(s1_rows) // (n_jobs * 4))
     
     log(f"  blocking: parallelizing localized dot-products across {n_jobs} processes (multiprocessing)...")
-    chunks = [(s, min(s + chunk_size, n_queries)) for s in range(0, n_queries, chunk_size)]
+    chunks = [(s, min(s + chunk_size, len(s1_rows))) for s in range(0, len(s1_rows), chunk_size)]
     
     with mp.get_context("fork").Pool(processes=n_jobs) as pool:
         results = pool.map(_process_dot_chunk, chunks)
@@ -137,30 +166,6 @@ def fetch_and_rank(feat, s1_rows: np.ndarray, tgt_rows: np.ndarray, ctry: Sequen
         for v in BLOCK_VIEWS:
             out[v][0][start:end] = chunk_out[v][0]
             out[v][1][start:end] = chunk_out[v][1]
-            
-     for v in BLOCK_VIEWS:
-                depth = max(1, int(round(cfg.base_k[v] * scale)))
-                if len(cands) <= depth:
-                    k = len(cands)
-                    out[v][0][i, :k] = tgt_rows[cands]
-                    out[v][1][i, :k] = 1.0
-                else:
-                    sim = s1_mats[v][i].dot(tgt_mats[v][cands].T).toarray().flatten()
-                    k = depth
-                    order = np.argsort(-sim, kind="stable")[:k]
-                    out[v][0][i, :k] = tgt_rows[cands[order]]
-                    out[v][1][i, :k] = sim[order]
-
-    n_queries = len(s1_rows)
-    n_jobs = getattr(cfg, 'n_jobs', -1)
-    chunk_size = max(1, n_queries // 384)
-    
-    log(f"  blocking: parallelizing localized dot-products across {n_jobs} threads...")
-    from joblib import Parallel, delayed
-    Parallel(n_jobs=n_jobs, backend='threading')(
-        delayed(_process_chunk)(start, min(start + chunk_size, n_queries))
-        for start in range(0, n_queries, chunk_size)
-    )
             
     for v in BLOCK_VIEWS:
         depth = max(1, int(round(cfg.base_k[v] * scale)))
