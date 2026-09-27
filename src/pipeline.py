@@ -74,6 +74,7 @@ def train(data_dir: str, model_dir: str, cfg: Optional[Config] = None) -> dict:
     log(f"built {len(I)} candidate pairs ({int(y.sum())} positive) from {len(s1_rows)} Source-1 records")
 
     m1, m2, oof_final = model_mod.train_matcher(F, y, s1=I, cand=J, src=src[J], cfg=cfg)
+    import gc; del F; gc.collect()
     tau, oof_f05, grid = best_threshold(s1_pos, oof_final, y, n_true_by_s1, len(s1_rows), cfg.thr_grid)
     log(f"chosen threshold={tau}  out-of-fold macro F0.5={oof_f05:.4f}")
 

@@ -31,7 +31,7 @@ class Config:
     reg_alpha: float = 0.5
     early_stopping_rounds: int = 100
     stage2_conf_threshold: float = 0.5
-    use_stage2: str = "auto"          # auto | yes | no
+    use_stage2: str = "no"          # auto | yes | no
     unique_assign: str = "auto"       # auto | yes | no  (each S2/S3 record belongs to at most one S1 entity)
     thr_grid: tuple = field(default_factory=_grid)
     country_holdout: bool = True

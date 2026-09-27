@@ -142,6 +142,7 @@ def fit_cv(X: pd.DataFrame, y: np.ndarray, groups: np.ndarray, cfg, feature_name
         oof[va] = cal.predict(raw_va) if cal is not None else raw_va
         boosters.append(booster)
         calibrators.append(cal)
+        import gc; del dtr, dva; gc.collect()
         log(f"  fold {fold + 1}/{n_splits}: n_train={len(tr)} n_val={len(va)} pos_val={npos} "
             f"best_val_ap={best:.4f} calibrated={cal is not None}")
     kind = "lgb" if _HAS_LGB else "sk"
