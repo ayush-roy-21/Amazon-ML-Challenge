@@ -127,7 +127,11 @@ def fetch_and_rank(feat, s1_rows: np.ndarray, tgt_rows: np.ndarray, ctry: Sequen
 
     n_jobs = getattr(cfg, 'n_jobs', -1)
     if n_jobs <= 0:
-        n_jobs = mp.cpu_count()
+        import os
+        try:
+            n_jobs = len(os.sched_getaffinity(0))
+        except AttributeError:
+            n_jobs = mp.cpu_count()
         
     log(f"  blocking: fetching candidate pools for {len(s1_rows)} queries using multiprocessing...")
     with mp.get_context("fork").Pool(processes=n_jobs) as pool:
