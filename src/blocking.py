@@ -62,9 +62,9 @@ def fetch_and_rank(feat, s1_rows: np.ndarray, tgt_rows: np.ndarray, ctry: Sequen
     s_ctry = ctry_arr[s1_rows]
     s_post = np.asarray(feat.postal, dtype=object)[s1_rows]
     
-    cands_per_s1 = []
-    log(f"  blocking: fetching candidate pools for {len(s1_rows)} queries...")
-    for c, p, z in zip(s_ctry, s_phon, s_post):
+    log(f"  blocking: fetching candidate pools for {len(s1_rows)} queries using multiprocessing...")
+    def _cands_for_row(args):
+        c, p, z = args
         c_safe = _safe_str(c)
         pp, zp = _prefixes(p, z)
         cands = set()
@@ -80,7 +80,15 @@ def fetch_and_rank(feat, s1_rows: np.ndarray, tgt_rows: np.ndarray, ctry: Sequen
                 cands.update(buckets_m2.get(zp, []))
             else:
                 cands.update(buckets_a2.get(zp, []))
-        cands_per_s1.append(np.array(sorted(cands), dtype=np.int32))
+        return np.array(sorted(cands), dtype=np.int32)
+        
+    import multiprocessing as mp
+    n_jobs = getattr(cfg, 'n_jobs', -1)
+    if n_jobs <= 0:
+        n_jobs = mp.cpu_count()
+        
+    with mp.get_context("fork").Pool(processes=n_jobs) as pool:
+        cands_per_s1 = pool.map(_cands_for_row, zip(s_ctry, s_phon, s_post), chunksize=2000)
         
     out: Ranked = {}
     for v in BLOCK_VIEWS:
