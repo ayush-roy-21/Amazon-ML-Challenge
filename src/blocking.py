@@ -110,12 +110,35 @@ def fetch_and_rank(feat, s1_rows: np.ndarray, tgt_rows: np.ndarray, ctry: Sequen
     s1_mats = {v: feat.views[v][s1_rows] for v in BLOCK_VIEWS}
     tgt_mats = {v: feat.views[v][tgt_rows] for v in BLOCK_VIEWS}
 
-    def _process_chunk(start, end):
-        for i in range(start, end):
-            cands = cands_per_s1[i]
-            if len(cands) == 0:
-                continue
-            for v in BLOCK_VIEWS:
+    global _GLOBAL_DOT_VARS
+    _GLOBAL_DOT_VARS = {
+        'base_k': cfg.base_k,
+        'scale': scale,
+        'cands_per_s1': cands_per_s1,
+        's1_mats': s1_mats,
+        'tgt_mats': tgt_mats,
+        'tgt_rows': tgt_rows
+    }
+    
+    n_queries = len(s1_rows)
+    n_jobs = getattr(cfg, 'n_jobs', -1)
+    if n_jobs <= 0:
+        n_jobs = mp.cpu_count()
+    chunk_size = max(1, n_queries // (n_jobs * 4))
+    
+    log(f"  blocking: parallelizing localized dot-products across {n_jobs} processes (multiprocessing)...")
+    chunks = [(s, min(s + chunk_size, n_queries)) for s in range(0, n_queries, chunk_size)]
+    
+    with mp.get_context("fork").Pool(processes=n_jobs) as pool:
+        results = pool.map(_process_dot_chunk, chunks)
+        
+    for chunk_idx, (start, end) in enumerate(chunks):
+        chunk_out = results[chunk_idx]
+        for v in BLOCK_VIEWS:
+            out[v][0][start:end] = chunk_out[v][0]
+            out[v][1][start:end] = chunk_out[v][1]
+            
+     for v in BLOCK_VIEWS:
                 depth = max(1, int(round(cfg.base_k[v] * scale)))
                 if len(cands) <= depth:
                     k = len(cands)
