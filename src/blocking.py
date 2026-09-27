@@ -25,6 +25,28 @@ def _safe_str(x):
 def _prefixes(p, z):
     return _safe_str(p)[:4], _safe_str(z)[:3]
 
+_GLOBAL_BUCKETS = {}
+
+def _cands_for_row(args):
+    c, p, z = args
+    c_safe = _safe_str(c)
+    pp, zp = _prefixes(p, z)
+    cands = set()
+    b = _GLOBAL_BUCKETS
+    if pp:
+        if c_safe:
+            cands.update(b['c1'].get((c_safe, pp), []))
+            cands.update(b['m1'].get(pp, []))
+        else:
+            cands.update(b['a1'].get(pp, []))
+    if zp:
+        if c_safe:
+            cands.update(b['c2'].get((c_safe, zp), []))
+            cands.update(b['m2'].get(zp, []))
+        else:
+            cands.update(b['a2'].get(zp, []))
+    return np.array(sorted(cands), dtype=np.int32)
+
 def fetch_and_rank(feat, s1_rows: np.ndarray, tgt_rows: np.ndarray, ctry: Sequence[str], cfg,
                     depth_scale: float = None) -> Ranked:
     """Deterministic bucket pre-filtering + localized TF-IDF dot products."""
@@ -63,25 +85,13 @@ def fetch_and_rank(feat, s1_rows: np.ndarray, tgt_rows: np.ndarray, ctry: Sequen
     s_post = np.asarray(feat.postal, dtype=object)[s1_rows]
     
     log(f"  blocking: fetching candidate pools for {len(s1_rows)} queries using multiprocessing...")
-    def _cands_for_row(args):
-        c, p, z = args
-        c_safe = _safe_str(c)
-        pp, zp = _prefixes(p, z)
-        cands = set()
-        if pp:
-            if c_safe:
-                cands.update(buckets_c1.get((c_safe, pp), []))
-                cands.update(buckets_m1.get(pp, []))
-            else:
-                cands.update(buckets_a1.get(pp, []))
-        if zp:
-            if c_safe:
-                cands.update(buckets_c2.get((c_safe, zp), []))
-                cands.update(buckets_m2.get(zp, []))
-            else:
-                cands.update(buckets_a2.get(zp, []))
-        return np.array(sorted(cands), dtype=np.int32)
-        
+    global _GLOBAL_BUCKETS
+    _GLOBAL_BUCKETS = {
+        'c1': buckets_c1, 'c2': buckets_c2,
+        'm1': buckets_m1, 'm2': buckets_m2,
+        'a1': buckets_a1, 'a2': buckets_a2
+    }
+
     import multiprocessing as mp
     n_jobs = getattr(cfg, 'n_jobs', -1)
     if n_jobs <= 0:
