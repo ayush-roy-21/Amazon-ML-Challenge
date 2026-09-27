@@ -26,27 +26,32 @@ def _safe_str(x):
     if s in ("nan", "none", "null"): return ""
     return s
 
-def _prefixes(p, z):
-    return _safe_str(p)[:4], _safe_str(z)[:3]
+
 
 def _cands_for_row(args):
-    c, p, z = args
+    c, psets, z = args
     c_safe = _safe_str(c)
-    pp, zp = _prefixes(p, z)
+    z_safe = _safe_str(z)
+    zp = z_safe[:3] if z_safe else ""
     cands = set()
     b = _GLOBAL_BUCKETS
-    if pp:
-        if c_safe:
-            cands.update(b['c1'].get((c_safe, pp), []))
-            cands.update(b['m1'].get(pp, []))
-        else:
-            cands.update(b['a1'].get(pp, []))
+    
     if zp:
         if c_safe:
             cands.update(b['c2'].get((c_safe, zp), []))
             cands.update(b['m2'].get(zp, []))
         else:
             cands.update(b['a2'].get(zp, []))
+            
+    for tok in psets:
+        tp = tok[:4]
+        if tp:
+            if c_safe:
+                cands.update(b['c1'].get((c_safe, tp), []))
+                cands.update(b['m1'].get(tp, []))
+            else:
+                cands.update(b['a1'].get(tp, []))
+                
     return np.array(sorted(cands), dtype=np.int32)
 
 def _process_dot_chunk(args):
@@ -90,13 +95,9 @@ def fetch_and_rank(feat, s1_rows: np.ndarray, tgt_rows: np.ndarray, ctry: Sequen
     
     t_ctry = ctry_arr[tgt_rows]
     
-    if "name_phon" in getattr(feat, "arr", {}):
-        t_phon = feat.arr["name_phon"][tgt_rows]
-        s_phon = feat.arr["name_phon"][s1_rows]
-    else:
-        name_phon_arr = feat.R["name_phon"].to_numpy(dtype=object)
-        t_phon = name_phon_arr[tgt_rows]
-        s_phon = name_phon_arr[s1_rows]
+    psets_arr = np.asarray(feat.psets, dtype=object)
+    t_phon = psets_arr[tgt_rows]
+    s_phon = psets_arr[s1_rows]
 
     t_post = np.asarray(feat.postal, dtype=object)[tgt_rows]
     
@@ -105,15 +106,20 @@ def fetch_and_rank(feat, s1_rows: np.ndarray, tgt_rows: np.ndarray, ctry: Sequen
     buckets_a1, buckets_a2 = defaultdict(list), defaultdict(list)
     
     log(f"  blocking: building inverted indexes for {len(tgt_rows)} targets...")
-    for i, (c, p, z) in enumerate(zip(t_ctry, t_phon, t_post)):
+    for i, (c, psets, z) in enumerate(zip(t_ctry, t_phon, t_post)):
         c_safe = _safe_str(c)
-        pp, zp = _prefixes(p, z)
-        if pp:
-            buckets_a1[pp].append(i)
-            (buckets_c1[(c_safe, pp)] if c_safe else buckets_m1[pp]).append(i)
+        z_safe = _safe_str(z)
+        zp = z_safe[:3] if z_safe else ""
+        
         if zp:
             buckets_a2[zp].append(i)
             (buckets_c2[(c_safe, zp)] if c_safe else buckets_m2[zp]).append(i)
+            
+        for tok in psets:
+            tp = tok[:4]
+            if tp:
+                buckets_a1[tp].append(i)
+                (buckets_c1[(c_safe, tp)] if c_safe else buckets_m1[tp]).append(i)
             
     s_ctry = ctry_arr[s1_rows]
     s_post = np.asarray(feat.postal, dtype=object)[s1_rows]
