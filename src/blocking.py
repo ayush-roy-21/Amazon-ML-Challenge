@@ -14,8 +14,16 @@ from .utils import log
 BLOCK_VIEWS = ("nchar", "nword", "ncomb", "aword", "nphon")
 Ranked = Dict[str, Tuple[np.ndarray, np.ndarray]]
 
+import math
+def _safe_str(x):
+    if x is None: return ""
+    if isinstance(x, float) and math.isnan(x): return ""
+    s = str(x).strip().lower()
+    if s in ("nan", "none", "null"): return ""
+    return s
+
 def _prefixes(p, z):
-    return (str(p)[:4] if p else ""), (str(z)[:3] if z else "")
+    return _safe_str(p)[:4], _safe_str(z)[:3]
 
 def fetch_and_rank(feat, s1_rows: np.ndarray, tgt_rows: np.ndarray, ctry: Sequence[str], cfg,
                     depth_scale: float = None) -> Ranked:
@@ -42,13 +50,14 @@ def fetch_and_rank(feat, s1_rows: np.ndarray, tgt_rows: np.ndarray, ctry: Sequen
     
     log(f"  blocking: building inverted indexes for {len(tgt_rows)} targets...")
     for i, (c, p, z) in enumerate(zip(t_ctry, t_phon, t_post)):
+        c_safe = _safe_str(c)
         pp, zp = _prefixes(p, z)
         if pp:
             buckets_a1[pp].append(i)
-            (buckets_c1[(c, pp)] if c else buckets_m1[pp]).append(i)
+            (buckets_c1[(c_safe, pp)] if c_safe else buckets_m1[pp]).append(i)
         if zp:
             buckets_a2[zp].append(i)
-            (buckets_c2[(c, zp)] if c else buckets_m2[zp]).append(i)
+            (buckets_c2[(c_safe, zp)] if c_safe else buckets_m2[zp]).append(i)
             
     s_ctry = ctry_arr[s1_rows]
     s_post = np.asarray(feat.postal, dtype=object)[s1_rows]
@@ -56,17 +65,18 @@ def fetch_and_rank(feat, s1_rows: np.ndarray, tgt_rows: np.ndarray, ctry: Sequen
     cands_per_s1 = []
     log(f"  blocking: fetching candidate pools for {len(s1_rows)} queries...")
     for c, p, z in zip(s_ctry, s_phon, s_post):
+        c_safe = _safe_str(c)
         pp, zp = _prefixes(p, z)
         cands = set()
         if pp:
-            if c:
-                cands.update(buckets_c1.get((c, pp), []))
+            if c_safe:
+                cands.update(buckets_c1.get((c_safe, pp), []))
                 cands.update(buckets_m1.get(pp, []))
             else:
                 cands.update(buckets_a1.get(pp, []))
         if zp:
-            if c:
-                cands.update(buckets_c2.get((c, zp), []))
+            if c_safe:
+                cands.update(buckets_c2.get((c_safe, zp), []))
                 cands.update(buckets_m2.get(zp, []))
             else:
                 cands.update(buckets_a2.get(zp, []))
